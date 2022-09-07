@@ -85,7 +85,7 @@ endif()
 
 if(${TRITON_ENABLE_KAFKA})
   set(LIBRDKAFKA_INCLUDE_DIR /usr/local/include)
-  set(LIBRDKAFKA_LIBRARY_DIR /usr/local/lib)
+  set(LIBRDKAFKA_LIBRARY_DIR /usr/local/lib/)
 endif()
 
 
@@ -133,7 +133,7 @@ else()
   target_compile_options(
     main
     PRIVATE
-      -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -Werror -lrdkafka
+      -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -Werror
   )
 endif()
 
@@ -666,6 +666,9 @@ if(${TRITON_ENABLE_KAFKA})
     )
   endif() # TRITON_ENABLE_NVTX
 
+  SET(CMAKE_EXE_LINKER_FLAGS 
+          "${CMAKE_EXE_LINKER_FLAGS} -Wl,-rpath -Wl,/usr/local/lib")
+          
   target_link_libraries(
     main
     PRIVATE
@@ -769,7 +772,7 @@ if (NOT WIN32)
     target_compile_options(
       simple
       PRIVATE
-        -Wall -Wextra -Wno-type-limits -Wno-unused-parameter -Wno-deprecated-declarations -Werror -lrdkafka
+        -Wall -Wextra -Wno-type-limits -Wno-unused-parameter -Wno-deprecated-declarations -Werror
     )
   endif()
 
