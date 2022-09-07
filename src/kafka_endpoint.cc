@@ -31,9 +31,11 @@ namespace triton { namespace server {
 KafkaEndpoint::KafkaEndpoint(
     const std::shared_ptr<TRITONSERVER_Server>& server,
     const std::shared_ptr<SharedMemoryManager>& shm_manager,
-    const std::string& port, const std::vector<std::string>& consumer_topics)
+    const std::string& port, const std::vector<std::string>& consumer_topics,
+    const std::string& producer_topic)
     : server_(server), shm_manager_(shm_manager), port_(port),
-      consumer_topics_(consumer_topics.begin(), consumer_topics.end())
+      consumer_topics_(consumer_topics.begin(), consumer_topics.end()),
+      producer_topic_(producer_topic)
 
 {
   allocator_ = nullptr;
@@ -66,17 +68,18 @@ KafkaEndpoint::Create(
     const std::shared_ptr<TRITONSERVER_Server>& server,
     const std::shared_ptr<SharedMemoryManager>& shm_manager,
     const std::string& port, const std::vector<std::string>& consumer_topics,
+    const std::string& producer_topic,
     std::unique_ptr<KafkaEndpoint>* kafka_endpoint)
 {
-  if (port.empty() || consumer_topics.empty()) {
+  if (port.empty() || consumer_topics.empty() || producer_topic.empty()) {
     return TRITONSERVER_ErrorNew(
         TRITONSERVER_ERROR_INVALID_ARG,
         "Kakfa [port], [producer topic], or [consumer topics] not specified");
   }
-  kafka_endpoint->reset(
-      new KafkaEndpoint(server, shm_manager, port, consumer_topics));
+  kafka_endpoint->reset(new KafkaEndpoint(
+      server, shm_manager, port, consumer_topics, producer_topic));
 
-  LOG_INFO << "Started Kafka Endpoint, subscribed to port: " << port;
+  LOG_INFO << "Started Kafka Endpoint, listening to port: " << port;
 
   return nullptr;  // Success
 }
@@ -84,9 +87,8 @@ KafkaEndpoint::Create(
 TRITONSERVER_Error*
 KafkaEndpoint::Start()
 {
-  RETURN_IF_ERR(StartProducer());
   RETURN_IF_ERR(StartConsumer());
-
+  RETURN_IF_ERR(StartProducer());
   return nullptr;  // Success
 }
 
@@ -141,12 +143,14 @@ KafkaEndpoint::StartConsumer()
 void
 KafkaEndpoint::CreateInferenceResponse(
     std::vector<std::pair<std::string, std::string>>& header_pair_vector,
-    const std::string& val)
+    const std::string& val, const std::string& request_id)
 {
+  std::string response_topic = current_request_map_[request_id]["response_topic"];
+  LOG_INFO << "Response Topic: " << response_topic;
   LOG_INFO << "Creating inference response";
   std::unique_ptr<kafka::clients::producer::ProducerRecord> response_record(
       std::make_unique<kafka::clients::producer::ProducerRecord>(
-          "output", kafka::NullKey, kafka::Value(val.c_str(), val.size())));
+          response_topic, kafka::NullKey, kafka::Value(val.c_str(), val.size())));
   LOG_INFO << "[" << &response_record << "]";
 
   for (auto it = header_pair_vector.begin(); it != header_pair_vector.end();
@@ -155,6 +159,8 @@ KafkaEndpoint::CreateInferenceResponse(
         it->first, kafka::Header::Value(it->second.c_str(), it->second.size()));
   }
   ProduceInferenceResponse(response_record);
+  // Release the request ID so that it can used again
+  current_request_map_.erase(request_id);
 }
 
 
@@ -188,18 +194,16 @@ KafkaEndpoint::ConsumeRequests()
       auto records = consumer_->poll(std::chrono::milliseconds(100));
       for (const auto& record : records) {
         if (!record.error()) {
-          std::cout << "% Got a new message..." << std::endl;
-          std::cout << "    Topic    : " << record.topic() << std::endl;
-          std::cout << "    Partition: " << record.partition() << std::endl;
-          std::cout << "    Offset   : " << record.offset() << std::endl;
-          std::cout << "    Timestamp: " << record.timestamp().toString()
-                    << std::endl;
-          std::cout << "    Headers  : " << kafka::toString(record.headers())
-                    << std::endl;
-          std::cout << "    Key   [" << record.key().toString() << "]"
-                    << std::endl;
-          std::cout << "    Value [" << record.value().toString() << "]"
-                    << std::endl;
+          LOG_INFO << "New Kafka Message";
+          LOG_INFO << "    Topic    : " << record.topic();
+          LOG_VERBOSE(1) << "    Partition: " << record.partition();
+          LOG_VERBOSE(1) << "    Offset: " << record.offset();
+          LOG_VERBOSE(1) << "    Timestamp: " << record.timestamp().toString();
+          LOG_VERBOSE(1) << "    Headers: "
+                         << kafka::toString(record.headers());
+          LOG_VERBOSE(1) << "    Key   [" << record.key().toString() << "]";
+          LOG_VERBOSE(1) << "    Value [" << record.value().toString() << "]";
+
           TRITONSERVER_Error* err = HandleInferenceRequest(record);
           if (err != nullptr) {
             LOG_ERROR << "Failed to parse inference request: "
@@ -227,21 +231,29 @@ KafkaEndpoint::HandleInferenceRequest(
   std::string response_topic;
   std::string payload_header_length;
   std::map<std::string, std::string> inference_request_map;
-  CreateInferenceRequestMap(inference_request_map, inference_request_msg);
+  RETURN_IF_ERR(CreateInferenceRequestMap(
+      inference_request_map, inference_request_msg, request_id));
 
+  if(request_id.empty()) {
+    return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INVALID_ARG,
+          "Request id not provided, but is required.");
+  }
+  
   RETURN_IF_ERR(
       FindParameter(inference_request_map, "model_name", &model_name));
   RETURN_IF_ERR(
       FindParameter(inference_request_map, "model_version", &model_version));
   RETURN_IF_ERR(
       FindParameter(inference_request_map, "response_topic", &response_topic));
-  RETURN_IF_ERR(FindParameter(inference_request_map, "id", &request_id));
   RETURN_IF_ERR(FindParameter(
       inference_request_map, "payload_header_length", &payload_header_length));
 
+  current_request_map_[request_id] = inference_request_map;
+  current_request_map_[request_id]["response_topic"] = response_topic;
   LOG_INFO << "Request Parsed: [ name: " << model_name
            << ", version: " << model_version
-           << ", output topic: " << response_topic << ", id: " << request_id
+           << ", output topic: " << current_request_map_[request_id]["response_topic"] << ", id: " << request_id
            << ", payload header length: " << payload_header_length << "]";
 
   int64_t requested_model_version;
@@ -257,28 +269,45 @@ KafkaEndpoint::HandleInferenceRequest(
   std::unique_ptr<InferRequestClass> infer_request = CreateInferRequest();
 
   RETURN_IF_ERR(ParseInferenceRequestPayload(
-      inference_request_map, inference_request_msg, irequest, infer_request.get()));
-  const char* id = inference_request_map["id"].c_str();
+      inference_request_map, inference_request_msg, irequest,
+      infer_request.get()));
+  const char* id = request_id.c_str();
   LOG_INFO << "Setting id: " << id;
   // Check if this allows duplicate id
   RETURN_IF_ERR(TRITONSERVER_InferenceRequestSetId(irequest, id));
   LOG_INFO << "Executing request " << id;
-  RETURN_IF_ERR(ExecuteInferenceRequest(inference_request_map, irequest, infer_request));
+  RETURN_IF_ERR(
+      ExecuteInferenceRequest(inference_request_map, irequest, infer_request));
 
   return nullptr;  // Success
 }
 
-void
+TRITONSERVER_Error*
 KafkaEndpoint::CreateInferenceRequestMap(
     std::map<std::string, std::string>& inference_request_map,
-    const kafka::clients::consumer::ConsumerRecord& inference_request_msg)
+    const kafka::clients::consumer::ConsumerRecord& inference_request_msg,
+    std::string& request_id)
 {
   LOG_INFO << "Creating inference map";
   for (unsigned long i = 0; i < inference_request_msg.headers().size(); i++) {
     std::string key = inference_request_msg.headers().at(i).key;
     std::string value = inference_request_msg.headers().at(i).value.toString();
-    inference_request_map[key] = value;
+    if (key == "id") {
+      // Don't allow duplicate request IDs
+      if(current_request_map_.find(value) == current_request_map_.end()) {
+        request_id = value;
+      } else {
+        return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_INVALID_ARG,
+          ("Request id [" + value +
+          "] already exists.")
+              .c_str());
+      }
+    } else {
+      inference_request_map[key] = value;
+    }
   }
+  return nullptr; // Success
 }
 
 TRITONSERVER_Error*
@@ -288,12 +317,17 @@ KafkaEndpoint::FindParameter(
 {
   auto it = inference_request_map.find(parameter);
   if (it == inference_request_map.end()) {
-    LOG_INFO << "Failed to find " << std::string(parameter);
-    return TRITONSERVER_ErrorNew(
-        TRITONSERVER_ERROR_UNAVAILABLE,
-        ("Inference request parameter [" + std::string(parameter) +
-         "] is required, but was not found.")
-            .c_str());
+    if(std::string(parameter) == "response_topic") {
+      *value = producer_topic_;
+      return nullptr;
+    } else {
+      LOG_INFO << "Failed to find " << std::string(parameter);
+      return TRITONSERVER_ErrorNew(
+          TRITONSERVER_ERROR_UNAVAILABLE,
+          ("Inference request parameter [" + std::string(parameter) +
+          "] is required, but was not found.")
+              .c_str());
+    }
   }
   *value = it->second;
   return nullptr;  // Success
@@ -321,7 +355,7 @@ KafkaEndpoint::ParseInferenceRequestPayload(
             .c_str());
   }
   // data() returns a const void* which must be cast away and
-  // reinterpreted. Cannot use member function toString() 
+  // reinterpreted. Cannot use member function toString()
   // because it will corrupt the binary data payload.
   const char* payload_ptr = reinterpret_cast<char*>(
       const_cast<void*>(inference_request_msg.value().data()));
@@ -415,7 +449,7 @@ KafkaEndpoint::ParseInferenceRequestPayload(
       base[i] = *reinterpret_cast<unsigned char*>(start);
       start++;
     }
-    base[payload_length - 1] = '\0';
+    base[payload_length] = '\0';
     // Append the binary payload
     // base_final = base;
     RETURN_IF_ERR(TRITONSERVER_InferenceRequestAppendInputData(
@@ -448,7 +482,8 @@ KafkaEndpoint::ParseInferenceRequestPayload(
               AllocPayload::OutputInfo::BINARY, class_count)));
     }
   }
-  infer_req->alloc_payload_.default_output_kind_ = AllocPayload::OutputInfo::BINARY;
+  infer_req->alloc_payload_.default_output_kind_ =
+      AllocPayload::OutputInfo::BINARY;
 
   return nullptr;
 }
@@ -456,7 +491,8 @@ KafkaEndpoint::ParseInferenceRequestPayload(
 TRITONSERVER_Error*
 KafkaEndpoint::ExecuteInferenceRequest(
     std::map<std::string, std::string>& inference_request_map,
-    TRITONSERVER_InferenceRequest* irequest, std::unique_ptr<InferRequestClass>& infer_req)
+    TRITONSERVER_InferenceRequest* irequest,
+    std::unique_ptr<InferRequestClass>& infer_req)
 {
   const char* request_id = nullptr;
   TRITONSERVER_Error* err = nullptr;
@@ -465,8 +501,10 @@ KafkaEndpoint::ExecuteInferenceRequest(
         irequest, InferRequestClass::InferRequestComplete, nullptr);
     if (err == nullptr) {
       err = TRITONSERVER_InferenceRequestSetResponseCallback(
-          irequest, allocator_, reinterpret_cast<void*>(&infer_req->alloc_payload_),
-          InferRequestClass::InferResponseComplete, reinterpret_cast<void*>(infer_req.get()));
+          irequest, allocator_,
+          reinterpret_cast<void*>(&infer_req->alloc_payload_),
+          InferRequestClass::InferResponseComplete,
+          reinterpret_cast<void*>(infer_req.get()));
     }
     LOG_TRITONSERVER_ERROR(
         TRITONSERVER_InferenceRequestId(irequest, &request_id),
@@ -543,7 +581,8 @@ KafkaEndpoint::InferResponseAlloc(
     void** buffer_userp, TRITONSERVER_MemoryType* actual_memory_type,
     int64_t* actual_memory_type_id)
 {
-  LOG_INFO << "Kafka Infer response alloc " << tensor_name << " " << (int)byte_size;
+  LOG_INFO << "Kafka Infer response alloc " << tensor_name << " "
+           << (int)byte_size;
 
   AllocPayload* payload = reinterpret_cast<AllocPayload*>(userp);
   std::unordered_map<std::string, AllocPayload::OutputInfo*>& output_map =
@@ -587,7 +626,7 @@ KafkaEndpoint::InferResponseAlloc(
       *actual_memory_type_id = 0;
     }
     LOG_INFO << "Allocating memory";
-    char* transfer_buffer = (char*)malloc(byte_size+1);
+    char* transfer_buffer = (char*)malloc(byte_size + 1);
     *buffer = transfer_buffer;
 
     // Ownership passes to 'buffer_userp' which has the same lifetime
@@ -681,6 +720,14 @@ KafkaEndpoint::OutputBufferAttributes(
   return nullptr;  // Success
 }
 
+std::unique_ptr<KafkaEndpoint::InferRequestClass>
+KafkaEndpoint::CreateInferRequest()
+{
+  return std::unique_ptr<InferRequestClass>(
+      new InferRequestClass(*this, server_.get()));
+}
+
+
 
 void
 KafkaEndpoint::InferRequestClass::InferResponseComplete(
@@ -725,7 +772,7 @@ KafkaEndpoint::InferRequestClass::InferResponseComplete(
     LOG_INFO << "Response finalized";
   } else {
     LOG_ERROR << "Failed to parse inference request: "
-                      << TRITONSERVER_ErrorMessage(err);
+              << TRITONSERVER_ErrorMessage(err);
     LOG_INFO << "Deleting error message";
     TRITONSERVER_ErrorDelete(err);
   }
@@ -755,14 +802,17 @@ KafkaEndpoint::InferRequestClass::FinalizeResponse(
 
   const char* request_id = nullptr;
   RETURN_IF_ERR(TRITONSERVER_InferenceResponseId(response, &request_id));
-  header_pair_vector.push_back(std::pair<std::string,std::string>("id", request_id));
+  header_pair_vector.push_back(
+      std::pair<std::string, std::string>("id", request_id));
 
   const char* model_name;
   int64_t model_version;
   RETURN_IF_ERR(TRITONSERVER_InferenceResponseModel(
       response, &model_name, &model_version));
-  header_pair_vector.push_back(std::pair<std::string,std::string>("model_name", model_name));
-  header_pair_vector.push_back(std::pair<std::string,std::string>("model_version", std::to_string(model_version)));
+  header_pair_vector.push_back(
+      std::pair<std::string, std::string>("model_name", model_name));
+  header_pair_vector.push_back(std::pair<std::string, std::string>(
+      "model_version", std::to_string(model_version)));
 
   // If the response has any parameters, convert them to JSON.
   uint32_t parameter_count;
@@ -771,35 +821,16 @@ KafkaEndpoint::InferRequestClass::FinalizeResponse(
   if (parameter_count > 0) {
     triton::common::TritonJson::Value params_json(
         response_json, triton::common::TritonJson::ValueType::OBJECT);
-
+    LOG_INFO << "Parameter count is " << parameter_count;
     for (uint32_t pidx = 0; pidx < parameter_count; ++pidx) {
       const char* name;
       TRITONSERVER_ParameterType type;
       const void* vvalue;
       RETURN_IF_ERR(TRITONSERVER_InferenceResponseParameter(
           response, pidx, &name, &type, &vvalue));
-      switch (type) {
-        case TRITONSERVER_PARAMETER_BOOL:
-          RETURN_IF_ERR(params_json.AddBool(
-              name, *(reinterpret_cast<const bool*>(vvalue))));
-          break;
-        case TRITONSERVER_PARAMETER_INT:
-          RETURN_IF_ERR(params_json.AddInt(
-              name, *(reinterpret_cast<const int64_t*>(vvalue))));
-          break;
-        case TRITONSERVER_PARAMETER_STRING:
-          RETURN_IF_ERR(params_json.AddStringRef(
-              name, reinterpret_cast<const char*>(vvalue)));
-          break;
-        case TRITONSERVER_PARAMETER_BYTES:
-          return TRITONSERVER_ErrorNew(
-              TRITONSERVER_ERROR_UNSUPPORTED,
-              "Response parameter of type 'TRITONSERVER_PARAMETER_BYTES' is "
-              "not currently supported");
-          break;
-      }
+      RETURN_IF_ERR(params_json.AddStringRef(
+          name, reinterpret_cast<const char*>(vvalue)));
     }
-
     RETURN_IF_ERR(response_json.Add("parameters", std::move(params_json)));
   }
 
@@ -884,31 +915,49 @@ KafkaEndpoint::InferRequestClass::FinalizeResponse(
   triton::common::TritonJson::WriteBuffer buffer;
   RETURN_IF_ERR(response_json.Write(&buffer));
   LOG_INFO << "Json response: " << buffer.Base();
+  header_pair_vector.push_back(std::pair<std::string, std::string>(
+      "payload_header_length", std::to_string(buffer.Size())));
+
 
   int additional_size = 0;
   if (!ordered_buffers.empty()) {
     for (size_t i = 0; i < ordered_buffers.size(); i++) {
       additional_size += byte_allocation_map[i];
     }
+  } else {
+    LOG_INFO << "Ordered buffers are empty " << buffer.Base();
   }
 
-  int total_size = buffer.Size()+additional_size+1;
+  int total_size = buffer.Size() + additional_size + 1;
   char* response_payload = (char*)malloc(total_size);
-  memcpy(response_payload, (char*)&buffer, buffer.Size());
+  memcpy(response_payload, (char*)&buffer.Base()[0], buffer.Size());
 
+  std::string bytes_arr = "[";
+  for (int i = 0; i < byte_allocation_map[0]; i++) {
+    bytes_arr += std::to_string(int(ordered_buffers[0][i])) + ", ";
+  }
+  LOG_INFO << bytes_arr;
   // If there is binary data write it next in the appropriate
   // order... also need the HTTP header when returning binary data.
   int offset = buffer.Size();
-  for(size_t i = 0; i < ordered_buffers.size(); i++) {
-    memcpy(&response_payload[offset], &ordered_buffers[i][0], byte_allocation_map[i]);
+  LOG_INFO << "Number of outputs: " << ordered_buffers.size();
+  for (size_t i = 0; i < ordered_buffers.size(); i++) {
+    LOG_INFO << "Char array size within buffer: " << byte_allocation_map[i];
+    memcpy(
+        &response_payload[offset], &ordered_buffers[i][0],
+        byte_allocation_map[i]);
     offset += byte_allocation_map[i];
   }
   response_payload[total_size] = '\0';
   LOG_INFO << "Total size: " << total_size;
-  std::string payload(response_payload);
-
+  std::string payload(response_payload, total_size);
+  LOG_INFO << payload.size();
+  std::ofstream out("output.txt", std::ios::binary);
+  out << payload;
+  out.close();
   LOG_INFO << response_payload;
-  //CreateInferenceResponse(header_pair_vector, payload);
+  parent_.CreateInferenceResponse(header_pair_vector, payload, request_id);
+  // CreateInferenceResponse(header_pair_vector, payload);
 
   free(response_payload);
 
